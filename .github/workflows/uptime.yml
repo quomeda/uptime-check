@@ -1,0 +1,101 @@
+name: Quomeda uptime
+
+# Every 5 minutes: is quomeda.com up and is everything behind it working?
+# A failure fails the run (GitHub emails that) and opens one issue; while it
+# stays down, one reminder an hour; when it is back, the issue is closed.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+# Never two checks at once; a slow one finishes before the next starts.
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    env:
+      GH_TOKEN: ${{ github.token }}
+      TITLE: Quomeda needs attention
+    steps:
+      - name: Check quomeda.com
+        id: probe
+        shell: bash
+        run: |
+          set -u
+          : > problems.md
+          probe() {
+            local url="$1" code=""
+            for attempt in 1 2; do
+              code=$(curl -sS -L -o body.txt -w '%{http_code}' --max-time 30 "$url" 2>/dev/null) || code="${code:-000}"
+              [ "$code" = "200" ] && { echo "- $url: 200"; return 0; }
+              [ "$attempt" = 1 ] && sleep 30
+            done
+            echo "- **$url answered ${code:-no answer}**" | tee -a problems.md
+            if [[ "$url" == */api/health ]] && jq -e . body.txt >/dev/null 2>&1; then
+              jq -r '"  - status: \(.status)",
+                     (if .database.ok then empty else "  - database: \(.database.error)" end),
+                     (.jobs[]? | select(.ok | not) | "  - \(.label): last worked \(.last_success_at // "never"), \(.consecutive_failures) failures in a row")' \
+                body.txt | tee -a problems.md
+            fi
+            return 1
+          }
+          {
+            echo "## Quomeda uptime, $(date -u '+%Y-%m-%d %H:%M UTC')"
+            probe https://quomeda.com/api/health || true
+            probe https://quomeda.com/ || true
+            probe https://survey.quomeda.com/ || true
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ -s problems.md ]; then echo "down=true" >> "$GITHUB_OUTPUT"; else echo "down=false" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Open, remind or close the issue
+        shell: bash
+        env:
+          DOWN: ${{ steps.probe.outputs.down }}
+        run: |
+          set -eu
+          repo="$GITHUB_REPOSITORY"
+          now=$(date -u '+%Y-%m-%d %H:%M UTC')
+          open=$(gh issue list --repo "$repo" --state open --label outage --json number,createdAt --jq '.[0] // empty')
+          if [ "$DOWN" = "true" ]; then
+            gh label create outage --repo "$repo" --color B60205 --description "quomeda.com or a job behind it is not working" --force >/dev/null
+            if [ -z "$open" ]; then
+              {
+                echo "First seen $now."
+                echo
+                cat problems.md
+                echo
+                echo "What to do: \`docs/backup-restore-and-uptime.md\` in the app repository, \"When an alert comes in\"."
+                echo "This issue closes itself when everything answers again."
+              } > issue.md
+              gh issue create --repo "$repo" --title "$TITLE" --label outage --body-file issue.md
+              echo "::error::Quomeda needs attention: $(head -1 problems.md)"
+              exit 1
+            fi
+            number=$(echo "$open" | jq -r .number)
+            # One reminder an hour, not one every five minutes.
+            last=$(gh issue view "$number" --repo "$repo" --json comments,createdAt \
+              --jq '([.createdAt] + [.comments[].createdAt]) | max')
+            age=$(( $(date -u +%s) - $(date -u -d "$last" +%s) ))
+            if [ "$age" -ge 3300 ]; then
+              { echo "Still not working at $now."; echo; cat problems.md; } > comment.md
+              gh issue comment "$number" --repo "$repo" --body-file comment.md
+              echo "::error::Quomeda still needs attention: $(head -1 problems.md)"
+              exit 1
+            fi
+            echo "::warning::Still down; the hourly reminder is not due yet (issue #$number)."
+          elif [ -n "$open" ]; then
+            number=$(echo "$open" | jq -r .number)
+            since=$(echo "$open" | jq -r .createdAt)
+            minutes=$(( ($(date -u +%s) - $(date -u -d "$since" +%s)) / 60 ))
+            gh issue comment "$number" --repo "$repo" --body "Back up at $now: everything answers again, about $minutes minutes after it was first seen."
+            gh issue close "$number" --repo "$repo"
+          fi
